@@ -1,5 +1,5 @@
 # Dynamo Python (CPython3) – Adjacent Room Pairs from Rooms
-# with "Wall-overlap exclusion" (Revit 2024)
+# RSL-only sampling + Wall-overlap exclusion (Revit 2024)
 
 import clr, math
 clr.AddReference('RevitAPI')
@@ -18,10 +18,8 @@ def mm_to_internal(mm):
 # ---------- パラメータ（既定値） ----------
 offset_mm      = 350.0
 sample_step_mm = 500.0
-# 壁重なり判定の余裕：±30mm
-overlap_pad_mm = 30.0
-# 平行と見なす角度（度）
-parallel_tol_deg = 10.0
+overlap_pad_mm = 30.0   # 壁重なり許容（±mm）
+parallel_tol_deg = 10.0 # 平行判定
 
 if 'IN' in globals():
     if len(IN) >= 2 and IN[1] is not None:
@@ -96,7 +94,7 @@ def room_at_point_prefiltered(pt, room_bbs):
         except: pass
     return None
 
-# 実曲線を弧長 STEP ピッチでサンプリング
+# 弧長 STEP ピッチでサンプリング
 def length_uniform_samples(curve, step_len):
     pts = []
     poly = curve.Tessellate()
@@ -134,26 +132,19 @@ def length_uniform_samples(curve, step_len):
         except: pass
     return pts
 
-# ---------- 壁データ（LocationCurve と半厚） ----------
+# ---------- 壁データ ----------
 def wall_half_thickness(wall):
     try:
         wt = wall.WallType
-        if wt:
-            # Width はタイプの厚み
-            return 0.5 * float(wt.Width)
+        if wt: return 0.5 * float(wt.Width)
     except: pass
-    # フォールバック：ビルトインパラメータ
     try:
         p = wall.WallType.get_Parameter(BuiltInParameter.WALL_ATTR_WIDTH_PARAM)
         if p: return 0.5 * float(p.AsDouble())
     except: pass
-    return mm_to_internal(50.0)  # 取得できない場合の保険
+    return mm_to_internal(50.0)
 
-walls = list(
-    FilteredElementCollector(doc)
-    .OfClass(Wall)
-    .WhereElementIsNotElementType()
-)
+walls = list(FilteredElementCollector(doc).OfClass(Wall).WhereElementIsNotElementType())
 walls_data = []
 for w in walls:
     try:
@@ -164,30 +155,22 @@ for w in walls:
                 walls_data.append((w, c, wall_half_thickness(w)))
     except: pass
 
-# ある点 pm（RSLサンプル点）と RSL の接線を使い、
-# 「壁に重なっているか」を判定
 def is_overlapped_with_wall(pm, rsl_tangent, walls_data):
     for w, wc, half_t in walls_data:
         prj = wc.Project(pm)
         if not prj: 
             continue
         q = prj.XYZPoint
-        # XY距離
         dx = pm.X - q.X; dy = pm.Y - q.Y
         dist_xy = (dx*dx + dy*dy) ** 0.5
         if dist_xy > (half_t + OVERLAP_PAD):
             continue
-        # 平行性チェック（接線ベクトルの内積）
-        try:
-            w_tan = tangent_xy(wc, prj.Parameter, normalized=False)
-        except:
-            w_tan = tangent_xy(wc, 0.5, normalized=False)
-        dot = abs(rsl_tangent.DotProduct(w_tan))
-        if dot >= COS_TOL:
+        w_tan = tangent_xy(wc, prj.Parameter, normalized=False)
+        if abs(rsl_tangent.DotProduct(w_tan)) >= COS_TOL:
             return True
     return False
 
-# ---------- 入力の Rooms 取得 ----------
+# ---------- 入力の Rooms ----------
 rooms_input = None
 if 'IN' in globals() and len(IN) >= 1 and IN[0] is not None:
     elems_in = IN[0] if isinstance(IN[0], list) else [IN[0]]
@@ -212,12 +195,11 @@ for r in rooms:
         bb = None
     room_bbs.append((r, bb))
 
-# ---------- メイン ----------
+# ---------- メイン（RSLのみを対象） ----------
 opt = SpatialElementBoundaryOptions()
 opt.SpatialElementBoundaryLocation = SpatialElementBoundaryLocation.Finish
 
-# pair_key -> {"clean":bool, "dirty":bool}
-pair_flags = {}
+pair_flags = {}  # key -> {"clean":bool, "dirty":bool}
 
 def mark_pair(a, b, clean_sample):
     ida = a.Id.IntegerValue; idb = b.Id.IntegerValue
@@ -234,13 +216,23 @@ for rm in rooms:
 
     for loop in segloops:
         for seg in loop:
-            # RSL/壁いずれの境界でもOK。実曲線を評価。
+            # ★ ここで RSL（部屋分割線）以外の境界は完全に除外 ★
+            eid = seg.ElementId
+            if not eid or eid == ElementId.InvalidElementId:
+                continue
+            host = doc.GetElement(eid)
+            if not isinstance(host, CurveElement):
+                continue
+            cat = host.Category
+            if not cat or cat.Id.IntegerValue != int(BuiltInCategory.OST_RoomSeparationLines):
+                continue
+
+            # RSL の実曲線で判定
             c = seg.GetCurve() if hasattr(seg, "GetCurve") else getattr(seg, "Curve", None)
             if c is None or c.Length < 1e-8:
                 continue
 
-            samples = length_uniform_samples(c, STEP)
-            for pm in samples:
+            for pm in length_uniform_samples(c, STEP):
                 prj = c.Project(pm)
                 tparam = prj.Parameter if prj else 0.5
                 tvec = tangent_xy(c, tparam, normalized=False)
@@ -260,19 +252,15 @@ for rm in rooms:
                     overlapped = is_overlapped_with_wall(pm, tvec, walls_data)
                     mark_pair(rm, left, clean_sample=(not overlapped))
 
-# ---------- 出力整理 ----------
-# ルール：
-# ・clean サンプルが1つでもあるペア → 採用
-# ・clean が無く dirty(=壁重なりのみ) だけのペア → 除外
+# ---------- 出力 ----------
 pairs = []
 for (ida, idb), flags in pair_flags.items():
-    if flags.get("clean", False):
+    if flags.get("clean", False):  # RSL単独で接している点が1箇所でもある
         a = doc.GetElement(ElementId(ida))
         b = doc.GetElement(ElementId(idb))
         if a and b:
             pairs.append([a, b])
 
-# 壁重なりのみのケースが全てで、かつ何も無ければ [None, None] を返す（必要なければ削除）
 if not pairs:
     pairs = [[None, None]]
 

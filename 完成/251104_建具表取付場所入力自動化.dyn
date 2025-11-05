@@ -1,0 +1,2052 @@
+{
+  "Uuid": "cece2c5d-63d9-42cf-b9aa-d1de05241e99",
+  "IsCustomNode": false,
+  "Description": "",
+  "Name": "251104_建具表取付場所入力自動化",
+  "ElementResolver": {
+    "ResolutionMap": {
+      "List": {
+        "Key": "List",
+        "Value": "BuiltIn.ds"
+      }
+    }
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "26b65ab16d4b4076929ea81410c0ef0b",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "40182ad1f13d41c88f9cd12c1ed5b03a",
+          "Name": "document",
+          "Description": "Revit.Application.Document",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "414f22cdbaf14fa1add69933c96b1000",
+          "Name": "View",
+          "Description": "View",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "Revit.Application.Document.ActiveView",
+      "Replication": "Auto",
+      "Description": "ドキュメントのアクティブ ビューを取得\n\nDocument.ActiveView: View"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "a59c562470624cb383a1e7185a14a054",
+      "NodeType": "FunctionNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "ae9cb5b4748c4f49b10a4c953ab36c76",
+          "Name": "Document",
+          "Description": "Document",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "Revit.Application.Document.Current",
+      "Replication": "Auto",
+      "Description": "現在のドキュメントを取得\n\nDocument.Current: Document"
+    },
+    {
+      "ConcreteType": "DSRevitNodesUI.Categories, DSRevitNodesUI",
+      "SelectedIndex": 120,
+      "SelectedString": "OST_Doors",
+      "Id": "85bc1218ec094238b8877f096eb7bdd2",
+      "NodeType": "ExtensionNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "95cd6d9fd85e49ef80f653aed34a6905",
+          "Name": "Category",
+          "Description": "選択した カテゴリ。",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "すべての組み込みカテゴリ。"
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n\r\nimport clr\r\n\r\n# Revit / Dynamo API 参照（ProtoGeometry 等の幾何は未使用）\r\nclr.AddReference(\"RevitServices\")\r\nfrom RevitServices.Persistence import DocumentManager\r\n\r\nclr.AddReference(\"RevitAPI\")\r\nfrom Autodesk.Revit.DB import BuiltInParameter\r\n\r\n# --- 入力 ---\r\ndoors = UnwrapElement(IN[0])  # 単体 or リストどちらでも可\r\n\r\n# --- 前処理：ActiveView のフェーズを明示取得（精度向上） ---\r\ndoc = DocumentManager.Instance.CurrentDBDocument\r\nav = doc.ActiveView\r\nphase_param = av.get_Parameter(BuiltInParameter.VIEW_PHASE)\r\nphase = doc.GetElement(phase_param.AsElementId()) if phase_param else None\r\n\r\n# --- 入力を反復可能に正規化 ---\r\nseq = doors if isinstance(doors, (list, tuple)) else [doors]\r\n\r\n# --- From/ToRoom 取得（例外非使用・属性存在チェックで分岐） ---\r\ndef get_rooms(inst):\r\n    \"\"\"FamilyInstance から [FromRoom, ToRoom] を返す。取得不可は None。\"\"\"\r\n    if inst is None:\r\n        return [None, None]\r\n\r\n    # RevitAPI のメソッドがあれば優先（フェーズを明示して精度確保）\r\n    if hasattr(inst, \"get_FromRoom\") and hasattr(inst, \"get_ToRoom\") and phase is not None:\r\n        fr = inst.get_FromRoom(phase)\r\n        tr = inst.get_ToRoom(phase)\r\n        return [fr, tr]\r\n\r\n    # フォールバック：Dynamo 側の簡易プロパティ\r\n    fr = inst.FromRoom if hasattr(inst, \"FromRoom\") else None\r\n    tr = inst.ToRoom if hasattr(inst, \"ToRoom\") else None\r\n    return [fr, tr]\r\n\r\n# --- 生ペア生成 ---\r\nraw_pairs = [get_rooms(d) for d in seq]\r\n\r\n# --- ユーティリティ：Room -> 安定なID（None対応） ---\r\ndef room_id(r):\r\n    return None if r is None else r.Id.IntegerValue\r\n\r\n# --- 整理ルール ---\r\n# 1) None を含むペアは除去\r\n# 2) 同じ部屋同士 [x, x] は除去\r\n# 3) [A, B] と [B, A] は同一扱いで重複除去（最初に現れた向きを残す）\r\nunique = []\r\nseen = set()  # key = (min(idA,idB), max(idA,idB))\r\n\r\nfor fr, tr in raw_pairs:\r\n    ida, idb = room_id(fr), room_id(tr)\r\n\r\n    # 1) None を含む → スキップ\r\n    if ida is None or idb is None:\r\n        continue\r\n    # 2) 同一室ペア → スキップ\r\n    if ida == idb:\r\n        continue\r\n\r\n    key = (ida, idb) if ida <= idb else (idb, ida)  # 順序無視キー\r\n    if key in seen:\r\n        continue\r\n    seen.add(key)\r\n    unique.append([fr, tr])  # 向き（From/To）は最初の出現を維持\r\n\r\n# --- 出力（形状互換） ---\r\n# ・リスト入力 → [[from, to], ...]（整理済み）\r\n# ・単体入力   → [from, to] or []（条件を満たさない場合は空）\r\nOUT = unique if isinstance(doors, (list, tuple)) else (unique[0] if unique else [])\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "daff1351aebd428aa2f6019e9ff34a56",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "028b336d193648fe9c0c9fa688fc132c",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "ab7f34fd442b495aa5c1e759ead395be",
+          "Name": "OUT",
+          "Description": "Python スクリプトの結果",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "埋め込み Python スクリプトを実行します。"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "300c1b9f2ffc4c34bc071a08c17e4d16",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "0190c696ecf74bb3b34f3f47550a0b89",
+          "Name": "room",
+          "Description": "Revit.Elements.Room",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "eed5b4a4b44d420dbad53217f92b2c61",
+          "Name": "string",
+          "Description": "string",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "Revit.Elements.Room.Name",
+      "Replication": "Auto",
+      "Description": "部屋名称を取得します\n\nRoom.Name: string"
+    },
+    {
+      "ConcreteType": "DSRevitNodesUI.ElementsOfCategoryInView, DSRevitNodesUI",
+      "Id": "0c4c9815afdf489d9eee5f3a9ddc2933",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "f62ad8aa7ed34a0991f84e34cfde9ae0",
+          "Name": "Category",
+          "Description": "カテゴリ",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "1cb646ba4bf84e76926fed6a9be2e6ba",
+          "Name": "View",
+          "Description": "ビュー",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "9a4567a8a7f5494cb592cb3cbf772e7a",
+          "Name": "Elements",
+          "Description": "要素クラス。",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "指定したビューで、指定したカテゴリのすべての要素をモデルから取得します。"
+    },
+    {
+      "ConcreteType": "DSRevitNodesUI.Categories, DSRevitNodesUI",
+      "SelectedIndex": 715,
+      "SelectedString": "OST_Rooms",
+      "Id": "c575ac3cbdd7449788943a1ab76e65b6",
+      "NodeType": "ExtensionNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "e73e7ef3a23e46c2a0bc922fb30fbaa2",
+          "Name": "Category",
+          "Description": "選択した カテゴリ。",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "すべての組み込みカテゴリ。"
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# Dynamo Python (CPython3) – Adjacent Room Pairs from Rooms\r\n# RSL-only sampling + Wall-overlap exclusion (Revit 2024)\r\n\r\nimport clr, math\r\nclr.AddReference('RevitAPI')\r\nclr.AddReference('RevitServices')\r\n\r\nfrom Autodesk.Revit.DB import *\r\nfrom RevitServices.Persistence import DocumentManager\r\n\r\ndoc = DocumentManager.Instance.CurrentDBDocument\r\nZAXIS = XYZ.BasisZ\r\n\r\n# ---------- 単位 ----------\r\ndef mm_to_internal(mm):\r\n    return UnitUtils.ConvertToInternalUnits(mm, UnitTypeId.Millimeters)\r\n\r\n# ---------- パラメータ（既定値） ----------\r\noffset_mm      = 350.0\r\nsample_step_mm = 500.0\r\noverlap_pad_mm = 30.0   # 壁重なり許容（±mm）\r\nparallel_tol_deg = 10.0 # 平行判定\r\n\r\nif 'IN' in globals():\r\n    if len(IN) >= 2 and IN[1] is not None:\r\n        try: offset_mm = float(IN[1])\r\n        except: pass\r\n    if len(IN) >= 3 and IN[2] is not None:\r\n        try: sample_step_mm = float(IN[2])\r\n        except: pass\r\n\r\nOFFSET      = mm_to_internal(offset_mm)\r\nSTEP        = mm_to_internal(sample_step_mm)\r\nBB_PAD      = mm_to_internal(400.0)\r\nOVERLAP_PAD = mm_to_internal(overlap_pad_mm)\r\nCOS_TOL     = math.cos(math.radians(parallel_tol_deg))\r\n\r\n# ---------- ユーティリティ ----------\r\ndef to_db(elem):\r\n    api = getattr(elem, 'InternalElement', None)\r\n    if api: return api\r\n    try:\r\n        return UnwrapElement(elem)\r\n    except:\r\n        return elem\r\n\r\ndef is_room(e):\r\n    try:\r\n        return isinstance(e, SpatialElement) and e.Category and \\\r\n               e.Category.Id.IntegerValue == int(BuiltInCategory.OST_Rooms)\r\n    except:\r\n        return False\r\n\r\ndef norm_vec(v):\r\n    if not v or v.GetLength() < 1e-12:\r\n        return XYZ.BasisX\r\n    return v.Normalize()\r\n\r\ndef tangent_xy(curve, param, normalized=False):\r\n    try:\r\n        deriv = curve.ComputeDerivatives(param, normalized)\r\n        tvec  = norm_vec(deriv.BasisX)\r\n    except:\r\n        p0, p1 = curve.GetEndPoint(0), curve.GetEndPoint(1)\r\n        tvec = norm_vec(p1.Subtract(p0))\r\n    return tvec\r\n\r\ndef normal_xy_from_tangent(tvec):\r\n    n = ZAXIS.CrossProduct(tvec)\r\n    return norm_vec(n) if n.GetLength() >= 1e-12 else XYZ.BasisX\r\n\r\ndef expand_bbox_xy(bb, pad):\r\n    if bb is None: return None\r\n    mn, mx = bb.Min, bb.Max\r\n    mn2 = XYZ(mn.X - pad, mn.Y - pad, mn.Z)\r\n    mx2 = XYZ(mx.X + pad, mx.Y + pad, mx.Z)\r\n    bb2 = BoundingBoxXYZ(); bb2.Min = mn2; bb2.Max = mx2\r\n    return bb2\r\n\r\ndef bbox2d_contains(bb, pt):\r\n    if bb is None: return True\r\n    mn, mx = bb.Min, bb.Max\r\n    x, y = pt.X, pt.Y\r\n    return (mn.X <= x <= mx.X) and (mn.Y <= y <= mx.Y)\r\n\r\ndef candidate_rooms(pt, room_bbs):\r\n    return [r for (r, bb) in room_bbs if bbox2d_contains(bb, pt)]\r\n\r\ndef room_at_point_prefiltered(pt, room_bbs):\r\n    for r in candidate_rooms(pt, room_bbs):\r\n        try:\r\n            if r.IsPointInRoom(pt):\r\n                return r\r\n        except: pass\r\n    return None\r\n\r\n# 弧長 STEP ピッチでサンプリング\r\ndef length_uniform_samples(curve, step_len):\r\n    pts = []\r\n    poly = curve.Tessellate()\r\n    if not poly or len(poly) < 2:\r\n        try: pts.append(curve.Evaluate(0.5, True))\r\n        except: pass\r\n        return pts\r\n\r\n    cum = [0.0]\r\n    for i in range(1, len(poly)):\r\n        seg_len = poly[i].DistanceTo(poly[i-1])\r\n        cum.append(cum[-1] + seg_len)\r\n    total = cum[-1]\r\n    if total < 1e-8:\r\n        try: pts.append(curve.Evaluate(0.5, True))\r\n        except: pass\r\n        return pts\r\n\r\n    n = max(1, int(total / step_len))\r\n    targets = [total * (k / float(n + 1)) for k in range(1, n + 1)]\r\n\r\n    j = 1\r\n    for d in targets:\r\n        while j < len(cum) and cum[j] < d:\r\n            j += 1\r\n        if j >= len(cum): break\r\n        d0, d1 = cum[j-1], cum[j]\r\n        t = 0.5 if (d1 - d0) < 1e-12 else (d - d0) / (d1 - d0)\r\n        vec = poly[j].Subtract(poly[j-1])\r\n        p = poly[j-1].Add(vec.Multiply(t))\r\n        pts.append(p)\r\n\r\n    if not pts:\r\n        try: pts.append(curve.Evaluate(0.5, True))\r\n        except: pass\r\n    return pts\r\n\r\n# ---------- 壁データ ----------\r\ndef wall_half_thickness(wall):\r\n    try:\r\n        wt = wall.WallType\r\n        if wt: return 0.5 * float(wt.Width)\r\n    except: pass\r\n    try:\r\n        p = wall.WallType.get_Parameter(BuiltInParameter.WALL_ATTR_WIDTH_PARAM)\r\n        if p: return 0.5 * float(p.AsDouble())\r\n    except: pass\r\n    return mm_to_internal(50.0)\r\n\r\nwalls = list(FilteredElementCollector(doc).OfClass(Wall).WhereElementIsNotElementType())\r\nwalls_data = []\r\nfor w in walls:\r\n    try:\r\n        loc = w.Location\r\n        if isinstance(loc, LocationCurve):\r\n            c = loc.Curve\r\n            if c and c.Length > 1e-6:\r\n                walls_data.append((w, c, wall_half_thickness(w)))\r\n    except: pass\r\n\r\ndef is_overlapped_with_wall(pm, rsl_tangent, walls_data):\r\n    for w, wc, half_t in walls_data:\r\n        prj = wc.Project(pm)\r\n        if not prj: \r\n            continue\r\n        q = prj.XYZPoint\r\n        dx = pm.X - q.X; dy = pm.Y - q.Y\r\n        dist_xy = (dx*dx + dy*dy) ** 0.5\r\n        if dist_xy > (half_t + OVERLAP_PAD):\r\n            continue\r\n        w_tan = tangent_xy(wc, prj.Parameter, normalized=False)\r\n        if abs(rsl_tangent.DotProduct(w_tan)) >= COS_TOL:\r\n            return True\r\n    return False\r\n\r\n# ---------- 入力の Rooms ----------\r\nrooms_input = None\r\nif 'IN' in globals() and len(IN) >= 1 and IN[0] is not None:\r\n    elems_in = IN[0] if isinstance(IN[0], list) else [IN[0]]\r\n    rooms_input = [to_db(e) for e in elems_in if e is not None]\r\n\r\nif rooms_input and all(is_room(r) for r in rooms_input):\r\n    rooms = rooms_input\r\nelse:\r\n    rooms = list(\r\n        FilteredElementCollector(doc)\r\n        .OfCategory(BuiltInCategory.OST_Rooms)\r\n        .WhereElementIsNotElementType()\r\n    )\r\n\r\n# ---------- 近傍探索用に Room の膨張BBox ----------\r\nroom_bbs = []\r\nfor r in rooms:\r\n    try:\r\n        bb = r.get_BoundingBox(None)\r\n        bb = expand_bbox_xy(bb, BB_PAD) if bb else None\r\n    except:\r\n        bb = None\r\n    room_bbs.append((r, bb))\r\n\r\n# ---------- メイン（RSLのみを対象） ----------\r\nopt = SpatialElementBoundaryOptions()\r\nopt.SpatialElementBoundaryLocation = SpatialElementBoundaryLocation.Finish\r\n\r\npair_flags = {}  # key -> {\"clean\":bool, \"dirty\":bool}\r\n\r\ndef mark_pair(a, b, clean_sample):\r\n    ida = a.Id.IntegerValue; idb = b.Id.IntegerValue\r\n    key = (ida, idb) if ida < idb else (idb, ida)\r\n    flags = pair_flags.get(key, {\"clean\": False, \"dirty\": False})\r\n    if clean_sample: flags[\"clean\"] = True\r\n    else:            flags[\"dirty\"] = True\r\n    pair_flags[key] = flags\r\n\r\nfor rm in rooms:\r\n    segloops = rm.GetBoundarySegments(opt)\r\n    if not segloops: \r\n        continue\r\n\r\n    for loop in segloops:\r\n        for seg in loop:\r\n            # ★ ここで RSL（部屋分割線）以外の境界は完全に除外 ★\r\n            eid = seg.ElementId\r\n            if not eid or eid == ElementId.InvalidElementId:\r\n                continue\r\n            host = doc.GetElement(eid)\r\n            if not isinstance(host, CurveElement):\r\n                continue\r\n            cat = host.Category\r\n            if not cat or cat.Id.IntegerValue != int(BuiltInCategory.OST_RoomSeparationLines):\r\n                continue\r\n\r\n            # RSL の実曲線で判定\r\n            c = seg.GetCurve() if hasattr(seg, \"GetCurve\") else getattr(seg, \"Curve\", None)\r\n            if c is None or c.Length < 1e-8:\r\n                continue\r\n\r\n            for pm in length_uniform_samples(c, STEP):\r\n                prj = c.Project(pm)\r\n                tparam = prj.Parameter if prj else 0.5\r\n                tvec = tangent_xy(c, tparam, normalized=False)\r\n                nvec = normal_xy_from_tangent(tvec)\r\n\r\n                pL = pm.Add(nvec.Multiply(OFFSET))\r\n                pR = pm.Add(nvec.Negate().Multiply(OFFSET))\r\n\r\n                left  = room_at_point_prefiltered(pL, room_bbs)\r\n                right = room_at_point_prefiltered(pR, room_bbs)\r\n\r\n                # rm と向かい合う相手が見つかった場合のみ、壁重なりを評価\r\n                if left is rm and right is not None and right.Id != rm.Id:\r\n                    overlapped = is_overlapped_with_wall(pm, tvec, walls_data)\r\n                    mark_pair(rm, right, clean_sample=(not overlapped))\r\n                elif right is rm and left is not None and left.Id != rm.Id:\r\n                    overlapped = is_overlapped_with_wall(pm, tvec, walls_data)\r\n                    mark_pair(rm, left, clean_sample=(not overlapped))\r\n\r\n# ---------- 出力 ----------\r\npairs = []\r\nfor (ida, idb), flags in pair_flags.items():\r\n    if flags.get(\"clean\", False):  # RSL単独で接している点が1箇所でもある\r\n        a = doc.GetElement(ElementId(ida))\r\n        b = doc.GetElement(ElementId(idb))\r\n        if a and b:\r\n            pairs.append([a, b])\r\n\r\nif not pairs:\r\n    pairs = [[None, None]]\r\n\r\nOUT = pairs\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "b3b10b5276e34f358a30e266a1645814",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "89bab40f8d3149ef9947ee0eb1cf9dc5",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "4293b8f7c65b4354bf0ddf8a0e7fc715",
+          "Name": "OUT",
+          "Description": "Python スクリプトの結果",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "埋め込み Python スクリプトを実行します。"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "e31404e7cdee47f9aa52cd4d5f857d01",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "f2f053885b6643cc943e50e1a64639c2",
+          "Name": "room",
+          "Description": "Revit.Elements.Room",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "b0d87cc034d048ba8e1c863eae1d7304",
+          "Name": "string",
+          "Description": "string",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "Revit.Elements.Room.Name",
+      "Replication": "Auto",
+      "Description": "部屋名称を取得します\n\nRoom.Name: string"
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n\r\n# IN[0], IN[1] は、次のどちらかが入る前提：\r\n#  1) [[RoomX, RoomY], ...] という「ペアのリスト」\r\n#  2) [RoomX, RoomY, ...] という「部屋のリスト」\r\nA = IN[0] or []\r\nB = IN[1] or []\r\n\r\n# ---- 入力が「ペアのリスト」かどうかを判定 ----\r\ndef is_pair_list(x):\r\n    return (\r\n        isinstance(x, (list, tuple)) and\r\n        len(x) > 0 and\r\n        isinstance(x[0], (list, tuple)) and\r\n        len(x[0]) >= 2\r\n    )\r\n\r\n# ---- Room を安定して比較できるキーへ ----\r\ndef room_key(room):\r\n    if room is None:\r\n        return None\r\n    rid = getattr(room, \"Id\", None)\r\n    if rid is not None:\r\n        iv = getattr(rid, \"IntegerValue\", None)\r\n        if isinstance(iv, int):\r\n            return iv\r\n    uid = getattr(room, \"UniqueId\", None)\r\n    if uid is not None:\r\n        return str(uid)\r\n    # 最後の保険：文字列化\r\n    return str(room)\r\n\r\n# ---- 入力を「ペアの配列」に正規化 ----\r\npairs = []\r\n\r\n# A/B がペアのリストならそのまま追加\r\nif is_pair_list(A):\r\n    pairs.extend(A)\r\nif is_pair_list(B):\r\n    pairs.extend(B)\r\n\r\n# A/B が部屋のリストなら、対応する要素でペア化（短い方に合わせる）\r\nroomsA = A if (not is_pair_list(A) and isinstance(A, (list, tuple))) else []\r\nroomsB = B if (not is_pair_list(B) and isinstance(B, (list, tuple))) else []\r\nif roomsA and roomsB:\r\n    n = min(len(roomsA), len(roomsB))\r\n    for i in range(n):\r\n        pairs.append([roomsA[i], roomsB[i]])\r\n\r\n# ---- 整理：None除外 / 同室除外 / 順序無視の重複除外 ----\r\nunique = []\r\nseen = set()  # key = tuple(sorted([keyA_str, keyB_str]))\r\n\r\nfor p in pairs:\r\n    if not isinstance(p, (list, tuple)) or len(p) < 2:\r\n        continue\r\n\r\n    fr, to = p[0], p[1]\r\n    if fr is None or to is None:\r\n        continue\r\n\r\n    kf, kt = room_key(fr), room_key(to)\r\n    if kf is None or kt is None:\r\n        continue\r\n\r\n    # 同じ部屋同士 [x, x] は除外\r\n    if str(kf) == str(kt):\r\n        continue\r\n\r\n    # 並べ替えるのはキー（文字列）だけ → .NET オブジェクトをソートしない\r\n    key_sorted = tuple(sorted((str(kf), str(kt))))\r\n    if key_sorted in seen:\r\n        continue\r\n\r\n    seen.add(key_sorted)\r\n    # 向き（From→To）は最初に現れたものを採用\r\n    unique.append([fr, to])\r\n\r\nOUT = unique\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "a155735037764258a788ff9b7526724a",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "bb19af09a6814897a642cf0956fb9d4b",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "31c22a17916b45dfbf1ad8ea9dff5da6",
+          "Name": "IN[1]",
+          "Description": "Input #1",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "8d30432868a64ee3bbe8399e7d934ac9",
+          "Name": "OUT",
+          "Description": "Python スクリプトの結果",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "埋め込み Python スクリプトを実行します。"
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n\r\nfrom collections import deque, defaultdict\r\nfrom typing import List, Tuple, Dict, Hashable\r\n\r\n# ---------- 入力 ----------\r\n# IN[0] : [[RoomA, RoomB], [RoomC, RoomD], ...] という部屋ペアのリスト\r\npairs = IN[0] or []\r\n\r\n# ---------- Room -> 比較用キー（ハッシュ可能） ----------\r\ndef room_key(room):\r\n    if room is None:\r\n        return None\r\n    rid = getattr(room, \"Id\", None)\r\n    if rid is not None:\r\n        iv = getattr(rid, \"IntegerValue\", None)\r\n        if isinstance(iv, int):\r\n            return iv\r\n    uid = getattr(room, \"UniqueId\", None)\r\n    if uid is not None:\r\n        return str(uid)\r\n    # 最後の保険\r\n    return str(room)\r\n\r\n# ---------- ペアから無向エッジ集合を作成（自己ループ除去・重複除去） ----------\r\n# ここでは (u, v) という「キーのタプル」へ変換します\r\nedge_set = set()\r\nkey_to_room = {}  # 表示用：計算キー -> 代表Room（最初に出てきたもの）\r\n\r\nfor p in pairs:\r\n    if not isinstance(p, (list, tuple)) or len(p) < 2:\r\n        continue\r\n    a, b = p[0], p[1]\r\n    if a is None or b is None:\r\n        continue\r\n\r\n    ka, kb = room_key(a), room_key(b)\r\n    if ka is None or kb is None:\r\n        continue\r\n    if ka == kb:          # 自己ループ除外\r\n        continue\r\n\r\n    # 代表オブジェクト（最初に見つけた方）を記録\r\n    if ka not in key_to_room:\r\n        key_to_room[ka] = a\r\n    if kb not in key_to_room:\r\n        key_to_room[kb] = b\r\n\r\n    # 無向エッジは並び順に依らず1本に正規化\r\n    e = (ka, kb) if ka <= kb else (kb, ka)\r\n    edge_set.add(e)\r\n\r\nedges = list(edge_set)  # List[Tuple[Hashable, Hashable]]\r\n\r\n# ---------- 近接中心性（NetworkX と同じ定義 / 無向・非重み） ----------\r\ndef closeness_centrality(\r\n    edges: List[Tuple[Hashable, Hashable]],\r\n    wf_improved: bool = True,\r\n) -> Dict[Hashable, float]:\r\n    # 隣接集合\r\n    adj: Dict[Hashable, set] = defaultdict(set)\r\n    for u, v in edges:\r\n        if u == v:\r\n            continue\r\n        adj[u].add(v)\r\n        adj[v].add(u)\r\n\r\n    nodes = list(adj.keys())\r\n    N = len(nodes)\r\n    if N == 0:\r\n        return {}\r\n\r\n    def bfs_sum_dist(start):\r\n        dist = {start: 0}\r\n        q = deque([start])\r\n        while q:\r\n            x = q.popleft()\r\n            for y in adj[x]:\r\n                if y not in dist:\r\n                    dist[y] = dist[x] + 1\r\n                    q.append(y)\r\n        total = sum(d for n, d in dist.items() if n != start)\r\n        reachable = len(dist)\r\n        return total, reachable\r\n\r\n    C = {}\r\n    for s in nodes:\r\n        total_dist, reachable = bfs_sum_dist(s)\r\n        if reachable <= 1 or total_dist == 0:\r\n            C[s] = 0.0\r\n            continue\r\n        score = (reachable - 1) / total_dist\r\n        if wf_improved and N > 1:\r\n            score *= (reachable - 1) / (N - 1)\r\n        C[s] = float(score)\r\n    return C\r\n\r\n# ---------- 計算 ----------\r\nscores = closeness_centrality(edges, wf_improved=True)\r\n\r\n# ---------- Room オブジェクトへ戻して見やすく整形 ----------\r\n# [[Room, score], ...] をスコア降順で\r\nresult_list = []\r\nfor k, s in scores.items():\r\n    room = key_to_room.get(k, None)\r\n    result_list.append([room, s])\r\n\r\nresult_list.sort(key=lambda z: z[1], reverse=True)\r\n\r\n# 参考として、エッジ（キー表現）やキー→Roomの対応を返すことも可能\r\n# OUT = [result_list, edges, key_to_room]\r\nOUT = result_list",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "3d46a4b9782d4da292866a0b3c172329",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "8ca012a6407e4823a26943527a8971ba",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "cc1911e7e9bb447299c87c559099f40f",
+          "Name": "OUT",
+          "Description": "Python スクリプトの結果",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "埋め込み Python スクリプトを実行します。"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "e14379c3809b4bb19d09adee56f8c29a",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "85b0a614c25542c78bdf9f1c27dbde40",
+          "Name": "list",
+          "Description": "項目を取得するリスト。\n\nvar[]..[]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": true,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "f539dfc4511e4d9d96191fd6de06e310",
+          "Name": "index",
+          "Description": "取得する項目のインデックス。\n\nint",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "bfac9cfc60d040cbbc510c79c5b3a097",
+          "Name": "item",
+          "Description": "リスト内の特定のインデックスの項目。",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "DSCore.List.GetItemAtIndex@var[]..[],int",
+      "Replication": "Auto",
+      "Description": "リストの、指定されたインデックスにある項目を取得します。\n\nList.GetItemAtIndex (list: var[]..[], index: int): var[]..[]"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "24c3660605a3422195ce94c33367a909",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "3b9ecd37f28c4068b4c1d89f46cdb457",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "0;"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "7cafe7bb8f414371b0b1c8dfa1cc1319",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "2401a0e22bc04015b8bd4ca4dd7eec46",
+          "Name": "list",
+          "Description": "項目を取得するリスト。\n\nvar[]..[]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": true,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "578fb2274fe44aab87e8e4d597f6001c",
+          "Name": "index",
+          "Description": "取得する項目のインデックス。\n\nint",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "8cdcec1a38614c319da35f38e67ee6ee",
+          "Name": "item",
+          "Description": "リスト内の特定のインデックスの項目。",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "DSCore.List.GetItemAtIndex@var[]..[],int",
+      "Replication": "Auto",
+      "Description": "リストの、指定されたインデックスにある項目を取得します。\n\nList.GetItemAtIndex (list: var[]..[], index: int): var[]..[]"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "f5dd29113d654fdb914d213efe793ce9",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "5c82196f89ac48908c8bfbb315a411cd",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "1;"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "6a92eed44d8d4695a2a3f08fdb9edeb9",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "d73e8d80cee54870a514f3b95a9cc6a5",
+          "Name": "element",
+          "Description": "Revit.Elements.Element",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "2a7e1c42e14b437dab03bd87ccfb5e49",
+          "Name": "parameterName",
+          "Description": "設定するパラメータの名前。\n\nstring",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "e2a5bd1de52a4828bc802c94e3b41773",
+          "Name": "value",
+          "Description": "値。\n\nvar",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "dc29eb0f4e38458cbf7117e78780b063",
+          "Name": "Element",
+          "Description": "Element",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "Revit.Elements.Element.SetParameterByName@string,var",
+      "Replication": "Auto",
+      "Description": "いずれかの要素のパラメータを設定します。\n\nElement.SetParameterByName (parameterName: string, value: var): Element"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "421260b042334cfeb063715c6a4dc9e3",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "5b5878ad13d346cc8ec0fedbb07af965",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "\"近接中心性\";"
+    },
+    {
+      "ConcreteType": "DSRevitNodesUI.ElementsOfCategoryInView, DSRevitNodesUI",
+      "Id": "541f00f9119346bd9792924a1f32444c",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "bf2b6d185039445d86619c0474672bf0",
+          "Name": "Category",
+          "Description": "カテゴリ",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "ac29874e0e4d42ddbfdc366a99b1aa86",
+          "Name": "View",
+          "Description": "ビュー",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "a35f6ae9cddf49b6a16d16c1f173a9d5",
+          "Name": "Elements",
+          "Description": "要素クラス。",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "指定したビューで、指定したカテゴリのすべての要素をモデルから取得します。"
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n\r\nimport clr\r\n\r\n# Dynamo / Revit API\r\nclr.AddReference(\"RevitServices\")\r\nfrom RevitServices.Persistence import DocumentManager\r\nfrom RevitServices.Transactions import TransactionManager\r\n\r\nclr.AddReference(\"RevitNodes\")\r\nimport Revit\r\nclr.ImportExtensions(Revit.Elements)\r\n\r\nclr.AddReference(\"RevitAPI\")\r\nfrom Autodesk.Revit.DB import BuiltInParameter, StorageType\r\n\r\n# ===== 入力 =====\r\ndoors_in = UnwrapElement(IN[0])                           # ドア（単体 or リスト）\r\nPARAM_NAME_SCORE  = IN[1] if IN[1] else u\"近接中心性\"     # ⑫ 可変：近接中心性\r\nPARAM_NAME_DEGREE = IN[2] if IN[2] else u\"次数中心性\"     # ⑬ 可変：次数中心性\r\nPARAM_NAME_OUTPUT = u\"取付場所_変数\"\r\n\r\ndoors = doors_in if isinstance(doors_in, (list, tuple)) else [doors_in]\r\n\r\n# ===== 前処理：ActiveView のフェーズ（From/ToRoom取得の精度向上） =====\r\ndoc = DocumentManager.Instance.CurrentDBDocument\r\nav = doc.ActiveView\r\nphase_param = av.get_Parameter(BuiltInParameter.VIEW_PHASE)\r\nphase = doc.GetElement(phase_param.AsElementId()) if phase_param else None\r\n\r\ndef get_rooms(inst):\r\n    \"\"\"ドア(FamilyInstance)から [FromRoom, ToRoom] を返す。取得不可は None。\"\"\"\r\n    if inst is None:\r\n        return [None, None]\r\n    if hasattr(inst, \"get_FromRoom\") and hasattr(inst, \"get_ToRoom\") and phase is not None:\r\n        return [inst.get_FromRoom(phase), inst.get_ToRoom(phase)]\r\n    # フォールバック（Dynamo簡易プロパティ）\r\n    fr = getattr(inst, \"FromRoom\", None)\r\n    tr = getattr(inst, \"ToRoom\", None)\r\n    return [fr, tr]\r\n\r\ndef parse_numeric_from_param(p):\r\n    \"\"\"\r\n    Parameter から数値(float)を取得。\r\n    未設定/取得不可は None を返す。\r\n    \"\"\"\r\n    if p is None:\r\n        return None\r\n    try:\r\n        st = p.StorageType\r\n        if st == StorageType.Double:\r\n            v = p.AsDouble()\r\n            return None if v is None else float(v)\r\n        elif st == StorageType.Integer:\r\n            v = p.AsInteger()\r\n            return None if v is None else float(v)\r\n        elif st == StorageType.String:\r\n            s = p.AsString()\r\n            if s is None:\r\n                return None\r\n            s = s.strip()\r\n            if s == \"\":\r\n                return None\r\n            s = s.replace(\",\", \"\").replace(\"，\", \"\").replace(\"．\", \".\")\r\n            try:\r\n                return float(s)\r\n            except:\r\n                return None\r\n        else:\r\n            return None\r\n    except:\r\n        return None\r\n\r\ndef get_room_value(room, param_name):\r\n    \"\"\"Room 要素から param_name を Lookup し数値化して返す（なければ None）。\"\"\"\r\n    if room is None:\r\n        return None\r\n    try:\r\n        p = room.LookupParameter(param_name)\r\n        return parse_numeric_from_param(p)\r\n    except:\r\n        return None\r\n\r\ndef clear_output_param(elem, param_name):\r\n    \"\"\"\r\n    ② 既存の「取付場所_変数」を削除（クリア）。\r\n      - String型: 空文字\r\n      - Integer/Double型: 0\r\n    \"\"\"\r\n    if elem is None:\r\n        return False\r\n    p = elem.LookupParameter(param_name)\r\n    if p is None or p.IsReadOnly:\r\n        return False\r\n    try:\r\n        if p.StorageType == StorageType.String:\r\n            return p.Set(\"\")\r\n        elif p.StorageType == StorageType.Integer:\r\n            return p.Set(0)\r\n        elif p.StorageType == StorageType.Double:\r\n            return p.Set(0.0)\r\n        else:\r\n            return False\r\n    except:\r\n        return False\r\n\r\ndef set_output_param(elem, param_name, value):\r\n    \"\"\"\r\n    ⑩ 判定値を書き込み。\r\n    value が None（null）なら書き込まず、②でクリアした状態のままにする。\r\n    \"\"\"\r\n    if elem is None or value is None:\r\n        return False\r\n    p = elem.LookupParameter(param_name)\r\n    if p is None or p.IsReadOnly:\r\n        return False\r\n    try:\r\n        if p.StorageType == StorageType.Integer:\r\n            return p.Set(int(value))\r\n        elif p.StorageType == StorageType.Double:\r\n            return p.Set(float(value))\r\n        elif p.StorageType == StorageType.String:\r\n            return p.Set(str(int(value)))\r\n        else:\r\n            return False\r\n    except:\r\n        return False\r\n\r\ndef same_room(fr, to):\r\n    \"\"\"\r\n    FromRoom / ToRoom が同一か判定（⑧）。\r\n    ElementId で比較。どちらか None の場合は False。\r\n    \"\"\"\r\n    if fr is None or to is None:\r\n        return False\r\n    try:\r\n        return fr.Id == to.Id\r\n    except:\r\n        return False\r\n\r\ndef decide_value(fr, to, fr_score, to_score, fr_degree, to_degree):\r\n    \"\"\"\r\n    ③〜⑨の判定ロジックを実装して値を返す。\r\n      1: To側優先\r\n      2: From側優先\r\n      3: 同値（同点）\r\n      0: 両方 None（⑨）\r\n      None: null（⑥）\r\n    優先順位（安全側で早期判定）:\r\n      A) ⑨ 両方の部屋が None → 0\r\n      B) ⑧ 同一室 → 1\r\n      C) ⑥ 近接中心性が両方 None → None\r\n      D) ④ Fromのみ近接中心性あり → 1\r\n      E) ⑤ Toのみ近接中心性あり   → 2\r\n      F) ③ 近接中心性を比較（From>To→2, To>From→1, 同点→Gへ）\r\n      G) ⑥（同点時）次数中心性で比較（From>To→2, To>From→1, 同点/欠損→Hへ）\r\n      H) ⑦ フォールバック：部屋の存在で決定（Fromのみ→1, Toのみ→2, 両方→1）\r\n    \"\"\"\r\n    # A) ⑨ 両方 None\r\n    if fr is None and to is None:\r\n        return 0\r\n\r\n    # B) ⑧ 同一室\r\n    if same_room(fr, to):\r\n        return 1\r\n\r\n    # C) ⑥ 近接中心性が両方 None（null）\r\n    if fr_score is None and to_score is None:\r\n        return None\r\n\r\n    # D) ④ Fromのみ入力\r\n    if fr_score is not None and to_score is None:\r\n        return 1\r\n\r\n    # E) ⑤ Toのみ入力\r\n    if fr_score is None and to_score is not None:\r\n        return 2\r\n\r\n    # F) ③ 両方あり：近接中心性で大小比較\r\n    if fr_score is not None and to_score is not None:\r\n        if fr_score > to_score:\r\n            return 2\r\n        elif fr_score < to_score:\r\n            return 1\r\n        # 同点 → 次数中心性比較へ\r\n\r\n    # G) ⑥（同点時）次数中心性で比較\r\n    if fr_degree is not None and to_degree is not None:\r\n        if fr_degree > to_degree:\r\n            return 2\r\n        elif fr_degree < to_degree:\r\n            return 1\r\n        else:\r\n            # 完全同点 → フォールバックへ\r\n            pass\r\n    elif fr_degree is not None and to_degree is None:\r\n        # Fromのみ次数中心性があるが、仕様上ここで確定指示は無いのでフォールバックへ\r\n        pass\r\n    elif fr_degree is None and to_degree is not None:\r\n        # Toのみ次数中心性があるが、仕様上ここで確定指示は無いのでフォールバックへ\r\n        pass\r\n\r\n    # H) ⑦ フォールバック：From/To の「存在」で判定\r\n    if fr is not None and to is None:\r\n        return 1\r\n    if fr is None and to is not None:\r\n        return 2\r\n    # 両方存在する場合は 1 を返す（タイブレーク）\r\n    return 1\r\n\r\nresults = []\r\n\r\nTransactionManager.Instance.EnsureInTransaction(doc)\r\nfor d in doors:\r\n    # ② 既存「取付場所_変数」を削除（クリア）\r\n    clear_output_param(d, PARAM_NAME_OUTPUT)\r\n\r\n    # From / To 取得\r\n    fr, to = get_rooms(d)\r\n\r\n    # 近接中心性・次数中心性の値取得\r\n    fr_score  = get_room_value(fr, PARAM_NAME_SCORE)\r\n    to_score  = get_room_value(to, PARAM_NAME_SCORE)\r\n    fr_degree = get_room_value(fr, PARAM_NAME_DEGREE)\r\n    to_degree = get_room_value(to, PARAM_NAME_DEGREE)\r\n\r\n    # ③〜⑨ 判定\r\n    decided = decide_value(fr, to, fr_score, to_score, fr_degree, to_degree)\r\n\r\n    # ⑩ パラメーターへ書き込み（None は書き込まずクリア状態を維持）\r\n    set_output_param(d, PARAM_NAME_OUTPUT, decided)\r\n\r\n    results.append(decided)\r\nTransactionManager.Instance.TransactionTaskDone()\r\n\r\n# 出力：単体入力は単体、リスト入力はリスト\r\nOUT = results if isinstance(doors_in, (list, tuple)) else (results[0] if results else None)\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "26a70bbc030442ed8ba08ecf4f8f31d7",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "884b331d133246f4ba42da7990942fc3",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "c5128fe7301e42e3b419067b7dd0843f",
+          "Name": "IN[1]",
+          "Description": "Input #1",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "cbeb5c58ecc34f2cb405b083f25e6746",
+          "Name": "IN[2]",
+          "Description": "Input #2",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "542e1a55558649a1b4af854249382e66",
+          "Name": "OUT",
+          "Description": "Python スクリプトの結果",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "埋め込み Python スクリプトを実行します。"
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Logic.RefactoredIf, CoreNodeModels",
+      "Id": "e93a17e4c840477c8d0e14e7d3dae6db",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "0b3327659293437190beca7de7ca1a72",
+          "Name": "test",
+          "Description": "ブール値テスト",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "d3611fd51530462582c730e80fb60485",
+          "Name": "true",
+          "Description": "テストが true の場合に返されます",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "4780111d1331436f94d201d659e4d118",
+          "Name": "false",
+          "Description": "テストが false の場合に返されます",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "dce98c238ab046ea934927f1ce3f64b5",
+          "Name": "result",
+          "Description": "生成された結果ブロック",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Auto",
+      "Description": "テスト入力でどのブール値を切り替えるかに応じて、True または False のいずれかの入力の結果を返します。単一の分岐のみの実行を必要とする反復処理をサポートします。True の分岐と False の分岐が分離されており、相互に作用しないことが重要です。"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "4651c0bedba24090837c00dda14a0b12",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [
+        {
+          "Id": "74378621e4a1489d8af58a6107dbcced",
+          "Name": "x",
+          "Description": "x",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "6df1703a1e9d46da8cc360dad9355dca",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "List.Count(x)>0;"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "c6c338b65f464080ae06e9c45d24cb3b",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "d5b2e1ea25964f20a7275e41ce118d69",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "null;"
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n\r\nfrom collections import defaultdict\r\nfrom typing import List, Tuple, Dict, Hashable\r\n\r\n# ---------- 入力 ----------\r\n# IN[0] : [[RoomA, RoomB], [RoomC, RoomD], ...] という部屋ペアのリスト\r\npairs = IN[0] or []\r\n\r\n# ---------- Room -> 比較用キー（ハッシュ可能） ----------\r\ndef room_key(room):\r\n    if room is None:\r\n        return None\r\n    rid = getattr(room, \"Id\", None)\r\n    if rid is not None:\r\n        iv = getattr(rid, \"IntegerValue\", None)\r\n        if isinstance(iv, int):\r\n            return iv\r\n    uid = getattr(room, \"UniqueId\", None)\r\n    if uid is not None:\r\n        return str(uid)\r\n    # 最後の保険\r\n    return str(room)\r\n\r\n# ---------- ペアから無向エッジ集合を作成（自己ループ除去・重複除去） ----------\r\nedge_set = set()\r\nkey_to_room = {}\r\n\r\nfor p in pairs:\r\n    if not isinstance(p, (list, tuple)) or len(p) < 2:\r\n        continue\r\n    a, b = p[0], p[1]\r\n    if a is None or b is None:\r\n        continue\r\n\r\n    ka, kb = room_key(a), room_key(b)\r\n    if ka is None or kb is None:\r\n        continue\r\n    if ka == kb:\r\n        continue  # 自己ループ除外\r\n\r\n    if ka not in key_to_room:\r\n        key_to_room[ka] = a\r\n    if kb not in key_to_room:\r\n        key_to_room[kb] = b\r\n\r\n    e = (ka, kb) if ka <= kb else (kb, ka)\r\n    edge_set.add(e)\r\n\r\nedges: List[Tuple[Hashable, Hashable]] = list(edge_set)\r\n\r\n# ---------- 次数中心性（NetworkX と同定義） ----------\r\ndef degree_centrality_with_degree(\r\n    edges: List[Tuple[Hashable, Hashable]],\r\n) -> Dict[Hashable, Tuple[float, int]]:\r\n    \"\"\"\r\n    無向・非重み付きグラフの次数中心性と次数を同時に返す。\r\n      centrality(v) = degree(v) / (n - 1)\r\n      degree(v) = 隣接ノード数\r\n    \"\"\"\r\n    adj: Dict[Hashable, set] = defaultdict(set)\r\n    for u, v in edges:\r\n        if u == v:\r\n            continue\r\n        adj[u].add(v)\r\n        adj[v].add(u)\r\n\r\n    nodes = list(adj.keys())\r\n    n = len(nodes)\r\n    if n <= 1:\r\n        return {v: (0.0, 0) for v in nodes}\r\n\r\n    denom = float(n - 1)\r\n    return {v: (len(adj[v]) / denom, len(adj[v])) for v in nodes}\r\n\r\n# ---------- 計算 ----------\r\nscores = degree_centrality_with_degree(edges)\r\n\r\n# ---------- Room オブジェクトへ戻して整形（スコア降順） ----------\r\nresult_list = []\r\nfor k, (norm_score, degree) in scores.items():\r\n    room = key_to_room.get(k, None)\r\n    result_list.append([room, norm_score, degree])\r\n\r\nresult_list.sort(key=lambda z: z[1], reverse=True)\r\n\r\n# ---------- 出力 ----------\r\nOUT = result_list\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "438441ae9f7d4966ac828360f1faecfe",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "c8b390649f4746bd9f493730df6b4956",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "b9e440f880a94b47a188f647bbfd8862",
+          "Name": "OUT",
+          "Description": "Python スクリプトの結果",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "埋め込み Python スクリプトを実行します。"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "0c421db88b89420ead7fa793f0291b5e",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "02157df9d9064c49b16386e6db85144c",
+          "Name": "list",
+          "Description": "項目を取得するリスト。\n\nvar[]..[]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": true,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "bead9f78c6784f5286ec334688ddc90b",
+          "Name": "index",
+          "Description": "取得する項目のインデックス。\n\nint",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "16f017f90636419e9e2555f078bb35aa",
+          "Name": "item",
+          "Description": "リスト内の特定のインデックスの項目。",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "DSCore.List.GetItemAtIndex@var[]..[],int",
+      "Replication": "Auto",
+      "Description": "リストの、指定されたインデックスにある項目を取得します。\n\nList.GetItemAtIndex (list: var[]..[], index: int): var[]..[]"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "a81b74789b524c45ad9f4f07772f86ab",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "61edbc8ecfeb40bc86f5bc25e7559bb4",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "0;"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "2f524280be164a88826e05f9c35c0587",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "3a47c7fdf1074437aea32ef0220d95f6",
+          "Name": "list",
+          "Description": "項目を取得するリスト。\n\nvar[]..[]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": true,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "77e89ca32e3741189f0f935f774ca11b",
+          "Name": "index",
+          "Description": "取得する項目のインデックス。\n\nint",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "828c0cd1ec4e4a4fa96da6b97db46e52",
+          "Name": "item",
+          "Description": "リスト内の特定のインデックスの項目。",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "DSCore.List.GetItemAtIndex@var[]..[],int",
+      "Replication": "Auto",
+      "Description": "リストの、指定されたインデックスにある項目を取得します。\n\nList.GetItemAtIndex (list: var[]..[], index: int): var[]..[]"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "1613955bf2084f2e9ce957239609050b",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "d03bbc26fd8248ecbeadc6d699a2e34a",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "2;"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "87fecba4eeda4006b03bbb610d8528e8",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "31ca906f1002439b812abc2bcc04f07e",
+          "Name": "element",
+          "Description": "Revit.Elements.Element",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "867aaa169b6f4937a0742264b7013eab",
+          "Name": "parameterName",
+          "Description": "設定するパラメータの名前。\n\nstring",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "6ce4727357b74a919f4cd2def2f307b8",
+          "Name": "value",
+          "Description": "値。\n\nvar",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "50cf5ba0f0a3468f866541c1f63e895e",
+          "Name": "Element",
+          "Description": "Element",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "Revit.Elements.Element.SetParameterByName@string,var",
+      "Replication": "Auto",
+      "Description": "いずれかの要素のパラメータを設定します。\n\nElement.SetParameterByName (parameterName: string, value: var): Element"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "cc4590f8efd446dc9991bda512061e3f",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "43b8220d380c4300998c2ef99f6bbd95",
+          "Name": "element",
+          "Description": "Revit.Elements.Element",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "31fe2ca78e664595aff81b705f347646",
+          "Name": "parameterName",
+          "Description": "設定するパラメータの名前。\n\nstring",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "151ac3905c4c495b8fce23a7eb6be773",
+          "Name": "value",
+          "Description": "値。\n\nvar",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "b7602765fbc547f2916430982a3d4079",
+          "Name": "Element",
+          "Description": "Element",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "Revit.Elements.Element.SetParameterByName@string,var",
+      "Replication": "Auto",
+      "Description": "いずれかの要素のパラメータを設定します。\n\nElement.SetParameterByName (parameterName: string, value: var): Element"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "caa2720c604745398a4d6747017e1a18",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "c418f71c74af4318976b8a942930fac7",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "\"次数中心性\";"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "6ac8c9a983ab4d77b3b51c9fe9d87cbd",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "b916c435133c4a369f00ce5a602bb729",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "9999999;"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "86ee69c7d269412aa24ba1fb5cf3f45c",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "4a7d435a78bd43d6819387ec8c82cb35",
+          "Name": "element",
+          "Description": "Revit.Elements.Element",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "e6a59a90174940328d84b9edbd38a78d",
+          "Name": "parameterName",
+          "Description": "設定するパラメータの名前。\n\nstring",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "406ed93722a846bf9f889b27fd5f714d",
+          "Name": "value",
+          "Description": "値。\n\nvar",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "98103ccd7b8447fbbdafa080c1fcdccb",
+          "Name": "Element",
+          "Description": "Element",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "Revit.Elements.Element.SetParameterByName@string,var",
+      "Replication": "Auto",
+      "Description": "いずれかの要素のパラメータを設定します。\n\nElement.SetParameterByName (parameterName: string, value: var): Element"
+    },
+    {
+      "ConcreteType": "CoreNodeModels.Logic.RefactoredIf, CoreNodeModels",
+      "Id": "707ae259111849928902ec4e1c05d183",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "e96f101eae04433790226d3480ca43f6",
+          "Name": "test",
+          "Description": "ブール値テスト",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "736ada8b885f4c13816e04d065c84724",
+          "Name": "true",
+          "Description": "テストが true の場合に返されます",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "5751f75425264653aca7032305571b5c",
+          "Name": "false",
+          "Description": "テストが false の場合に返されます",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "c0ceb9b980cb4baba17919ceb9e5ef58",
+          "Name": "result",
+          "Description": "生成された結果ブロック",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Auto",
+      "Description": "テスト入力でどのブール値を切り替えるかに応じて、True または False のいずれかの入力の結果を返します。単一の分岐のみの実行を必要とする反復処理をサポートします。True の分岐と False の分岐が分離されており、相互に作用しないことが重要です。"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "08523dbd06584a7ca6ddb031b0d34abb",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [
+        {
+          "Id": "bed163775c484fc4b9514553ab8b2df7",
+          "Name": "x",
+          "Description": "x",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "2f5d68a739294e80929fcedc41c43590",
+          "Name": "y",
+          "Description": "y",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "3b9d7966f77e43fca82ccb0b038d9973",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "List.Count(x)==List.Count(y);"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "8ef3af4f371841d5a8e0f8406feca426",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "f2d11cdcbf014c3aaead1a4618a6a840",
+          "Name": "",
+          "Description": "行 1 の式の値",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "DesignScript のコードを直接作成することができます。",
+      "Code": "null;"
+    }
+  ],
+  "Connectors": [
+    {
+      "Start": "414f22cdbaf14fa1add69933c96b1000",
+      "End": "1cb646ba4bf84e76926fed6a9be2e6ba",
+      "Id": "af2af55068b94fd38953a59220ccddb8",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "414f22cdbaf14fa1add69933c96b1000",
+      "End": "ac29874e0e4d42ddbfdc366a99b1aa86",
+      "Id": "20577182641f492a939d084d09574816",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "ae9cb5b4748c4f49b10a4c953ab36c76",
+      "End": "40182ad1f13d41c88f9cd12c1ed5b03a",
+      "Id": "92a001d7b68948eb915b43b3ee25c775",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "95cd6d9fd85e49ef80f653aed34a6905",
+      "End": "bf2b6d185039445d86619c0474672bf0",
+      "Id": "c9d95c3bbae94e4f88a2490ecc826321",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "ab7f34fd442b495aa5c1e759ead395be",
+      "End": "0190c696ecf74bb3b34f3f47550a0b89",
+      "Id": "81d4ca5c0ab14c45b0fd0471c014a3fe",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "ab7f34fd442b495aa5c1e759ead395be",
+      "End": "31c22a17916b45dfbf1ad8ea9dff5da6",
+      "Id": "bf1e568ae2dc4a158f2f83bca5284df9",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "9a4567a8a7f5494cb592cb3cbf772e7a",
+      "End": "43b8220d380c4300998c2ef99f6bbd95",
+      "Id": "36f09f606eb5462588fae3bffec0bed8",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "9a4567a8a7f5494cb592cb3cbf772e7a",
+      "End": "4a7d435a78bd43d6819387ec8c82cb35",
+      "Id": "9998204428834001bafa49f578a40262",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "9a4567a8a7f5494cb592cb3cbf772e7a",
+      "End": "736ada8b885f4c13816e04d065c84724",
+      "Id": "7e447e201bc44c34b83ab579de60a73e",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "e73e7ef3a23e46c2a0bc922fb30fbaa2",
+      "End": "f62ad8aa7ed34a0991f84e34cfde9ae0",
+      "Id": "cad20ac0a4ca40da95edbc2c73215744",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "4293b8f7c65b4354bf0ddf8a0e7fc715",
+      "End": "f2f053885b6643cc943e50e1a64639c2",
+      "Id": "1db411d6b3d0403cbc3e65eb05fbd959",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "4293b8f7c65b4354bf0ddf8a0e7fc715",
+      "End": "bb19af09a6814897a642cf0956fb9d4b",
+      "Id": "35e31c15b5054824aec5977c62a74e4a",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "8d30432868a64ee3bbe8399e7d934ac9",
+      "End": "8ca012a6407e4823a26943527a8971ba",
+      "Id": "f1ea34b85ca14cb689c7af3e941a4472",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "8d30432868a64ee3bbe8399e7d934ac9",
+      "End": "c8b390649f4746bd9f493730df6b4956",
+      "Id": "8805b07a13964846a33e26637c525854",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "cc1911e7e9bb447299c87c559099f40f",
+      "End": "85b0a614c25542c78bdf9f1c27dbde40",
+      "Id": "89337741434345a89bb36fbdf7468a20",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "cc1911e7e9bb447299c87c559099f40f",
+      "End": "2401a0e22bc04015b8bd4ca4dd7eec46",
+      "Id": "7e0018da2c0a4732a152cd89cdea46e6",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "bfac9cfc60d040cbbc510c79c5b3a097",
+      "End": "d73e8d80cee54870a514f3b95a9cc6a5",
+      "Id": "4d9e99ca9f26463391ca4e63badd0c8b",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "3b9ecd37f28c4068b4c1d89f46cdb457",
+      "End": "f539dfc4511e4d9d96191fd6de06e310",
+      "Id": "dd287ffb8cf14207a5232a7c35e670f8",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "8cdcec1a38614c319da35f38e67ee6ee",
+      "End": "e2a5bd1de52a4828bc802c94e3b41773",
+      "Id": "c02e151b547940c5977e31db73fc23a7",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "5c82196f89ac48908c8bfbb315a411cd",
+      "End": "578fb2274fe44aab87e8e4d597f6001c",
+      "Id": "3f41e93718c04e55b3f9bb1dc1644946",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "dc29eb0f4e38458cbf7117e78780b063",
+      "End": "74378621e4a1489d8af58a6107dbcced",
+      "Id": "4829b82506604e05b918e18a6908dedd",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "5b5878ad13d346cc8ec0fedbb07af965",
+      "End": "2a7e1c42e14b437dab03bd87ccfb5e49",
+      "Id": "14361c7fec474e7f92a001f4d00456cd",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "5b5878ad13d346cc8ec0fedbb07af965",
+      "End": "e6a59a90174940328d84b9edbd38a78d",
+      "Id": "b639184a7bec4fb6ab196ec704484619",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "5b5878ad13d346cc8ec0fedbb07af965",
+      "End": "c5128fe7301e42e3b419067b7dd0843f",
+      "Id": "6b0851c3023e4b39b0ce08923ccf7e77",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "a35f6ae9cddf49b6a16d16c1f173a9d5",
+      "End": "028b336d193648fe9c0c9fa688fc132c",
+      "Id": "b33b5d632701452ebc8ad2f9c1e6672a",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "a35f6ae9cddf49b6a16d16c1f173a9d5",
+      "End": "d3611fd51530462582c730e80fb60485",
+      "Id": "0dedc4aba0b640c78877ba2101cae746",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "dce98c238ab046ea934927f1ce3f64b5",
+      "End": "884b331d133246f4ba42da7990942fc3",
+      "Id": "f7273ff52e4b4b11b77119d0581d84ac",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "6df1703a1e9d46da8cc360dad9355dca",
+      "End": "0b3327659293437190beca7de7ca1a72",
+      "Id": "3a0390da784d4630979bb63adb1abbb9",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "d5b2e1ea25964f20a7275e41ce118d69",
+      "End": "4780111d1331436f94d201d659e4d118",
+      "Id": "8a7b85ed30e14c2c99c922f78435866e",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "b9e440f880a94b47a188f647bbfd8862",
+      "End": "02157df9d9064c49b16386e6db85144c",
+      "Id": "1f21e6bfc9f341c890c10c974714248f",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "b9e440f880a94b47a188f647bbfd8862",
+      "End": "3a47c7fdf1074437aea32ef0220d95f6",
+      "Id": "2ab613ef9e1d4fbe90f5d9b255ff8414",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "16f017f90636419e9e2555f078bb35aa",
+      "End": "31ca906f1002439b812abc2bcc04f07e",
+      "Id": "06d288b3a1c64dc1ac71c2cf38bd88ed",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "61edbc8ecfeb40bc86f5bc25e7559bb4",
+      "End": "bead9f78c6784f5286ec334688ddc90b",
+      "Id": "207ca1f224524df096311f904f76de3d",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "828c0cd1ec4e4a4fa96da6b97db46e52",
+      "End": "6ce4727357b74a919f4cd2def2f307b8",
+      "Id": "78f8d417678a4d8ebae4570adeb87938",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "d03bbc26fd8248ecbeadc6d699a2e34a",
+      "End": "77e89ca32e3741189f0f935f774ca11b",
+      "Id": "d717e0489d044583a01de1895bc3f879",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "b7602765fbc547f2916430982a3d4079",
+      "End": "2f5d68a739294e80929fcedc41c43590",
+      "Id": "767f014931fb4589a2da879bc8aa72ca",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c418f71c74af4318976b8a942930fac7",
+      "End": "31fe2ca78e664595aff81b705f347646",
+      "Id": "806904d536274f2a91ff8e15aa269d38",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c418f71c74af4318976b8a942930fac7",
+      "End": "867aaa169b6f4937a0742264b7013eab",
+      "Id": "3521e895c6874d41a3c0f5fd3e509209",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c418f71c74af4318976b8a942930fac7",
+      "End": "cbeb5c58ecc34f2cb405b083f25e6746",
+      "Id": "28afbdefa82d4bea839fd0aef10af87e",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "b916c435133c4a369f00ce5a602bb729",
+      "End": "151ac3905c4c495b8fce23a7eb6be773",
+      "Id": "74b5d80dd0ef497280cf9a6080e39de4",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "b916c435133c4a369f00ce5a602bb729",
+      "End": "406ed93722a846bf9f889b27fd5f714d",
+      "Id": "25493bd99c124c7c8a5fbfa4ce70f6c8",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "98103ccd7b8447fbbdafa080c1fcdccb",
+      "End": "bed163775c484fc4b9514553ab8b2df7",
+      "Id": "d2e9df4767b34aee821f6ad3078a3f09",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c0ceb9b980cb4baba17919ceb9e5ef58",
+      "End": "89bab40f8d3149ef9947ee0eb1cf9dc5",
+      "Id": "d9fd5d7ba29c4b6c825a1eeca509ce22",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "3b9d7966f77e43fca82ccb0b038d9973",
+      "End": "e96f101eae04433790226d3480ca43f6",
+      "Id": "235792cdeb2542049003f88a56a2692b",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "f2d11cdcbf014c3aaead1a4618a6a840",
+      "End": "5751f75425264653aca7032305571b5c",
+      "Id": "7d982e2430eb47a48243f598ae1c81e9",
+      "IsHidden": "False"
+    }
+  ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "Thumbnail": "",
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "プロパティ",
+      "Version": "2.19",
+      "Data": {}
+    },
+    {
+      "ExtensionGuid": "DFBD9CC0-DB40-457A-939E-8C8555555A9D",
+      "Name": "Generative Design",
+      "Version": "6.1",
+      "Data": {}
+    }
+  ],
+  "Author": "",
+  "Linting": {
+    "activeLinter": "なし",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "2.19.3.6394",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "背景プレビュー(_B)",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "26b65ab16d4b4076929ea81410c0ef0b",
+        "Name": "Document.ActiveView",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 227.34509188155596,
+        "Y": -205.01904220693308
+      },
+      {
+        "Id": "a59c562470624cb383a1e7185a14a054",
+        "Name": "Document.Current",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": -65.47594004234719,
+        "Y": -194.58923682118711
+      },
+      {
+        "Id": "85bc1218ec094238b8877f096eb7bdd2",
+        "Name": "Categories",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 248.85242554910383,
+        "Y": 98.0221107325159
+      },
+      {
+        "Id": "daff1351aebd428aa2f6019e9ff34a56",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 5604.5348408095688,
+        "Y": 238.93423273296048
+      },
+      {
+        "Id": "300c1b9f2ffc4c34bc071a08c17e4d16",
+        "Name": "Room.Name",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 6316.7805656067076,
+        "Y": 232.90648199591192
+      },
+      {
+        "Id": "0c4c9815afdf489d9eee5f3a9ddc2933",
+        "Name": "All Elements of Category in View",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1279.9086897648128,
+        "Y": -339.66569633417174
+      },
+      {
+        "Id": "c575ac3cbdd7449788943a1ab76e65b6",
+        "Name": "Categories",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 311.24406115777174,
+        "Y": -442.46160167746257
+      },
+      {
+        "Id": "b3b10b5276e34f358a30e266a1645814",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 5562.5116441496157,
+        "Y": -513.58237869959771
+      },
+      {
+        "Id": "e31404e7cdee47f9aa52cd4d5f857d01",
+        "Name": "Room.Name",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 6336.7560407279743,
+        "Y": -508.76289075826617
+      },
+      {
+        "Id": "a155735037764258a788ff9b7526724a",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 6698.5470574208794,
+        "Y": -125.29228485084985
+      },
+      {
+        "Id": "3d46a4b9782d4da292866a0b3c172329",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 7711.5284177127005,
+        "Y": -497.49270582092004
+      },
+      {
+        "Id": "e14379c3809b4bb19d09adee56f8c29a",
+        "Name": "List.GetItemAtIndex",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 8963.1134372504421,
+        "Y": -650.9659241828208
+      },
+      {
+        "Id": "24c3660605a3422195ce94c33367a909",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 8738.3781008051574,
+        "Y": -583.74764063683028
+      },
+      {
+        "Id": "7cafe7bb8f414371b0b1c8dfa1cc1319",
+        "Name": "List.GetItemAtIndex",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 8968.6230203305677,
+        "Y": -146.83907235174604
+      },
+      {
+        "Id": "f5dd29113d654fdb914d213efe793ce9",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 8735.6233092650982,
+        "Y": -101.65912112623948
+      },
+      {
+        "Id": "6a92eed44d8d4695a2a3f08fdb9edeb9",
+        "Name": "Element.SetParameterByName",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 9577.9959600943639,
+        "Y": -383.08278963792213
+      },
+      {
+        "Id": "421260b042334cfeb063715c6a4dc9e3",
+        "Name": "近接中心性のパラメーター名",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 213.525010730011,
+        "Y": -1038.0265081819359
+      },
+      {
+        "Id": "541f00f9119346bd9792924a1f32444c",
+        "Name": "All Elements of Category in View",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1298.069485519,
+        "Y": 610.772515961235
+      },
+      {
+        "Id": "26a70bbc030442ed8ba08ecf4f8f31d7",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 11116.970798596116,
+        "Y": 531.554156541027
+      },
+      {
+        "Id": "e93a17e4c840477c8d0e14e7d3dae6db",
+        "Name": "If",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 10680.692536269058,
+        "Y": 538.65024948629662
+      },
+      {
+        "Id": "4651c0bedba24090837c00dda14a0b12",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 10395.278342077401,
+        "Y": 463.17786425663212
+      },
+      {
+        "Id": "c6c338b65f464080ae06e9c45d24cb3b",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 10404.0706553066,
+        "Y": 675.61220159150866
+      },
+      {
+        "Id": "438441ae9f7d4966ac828360f1faecfe",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 7739.4175899875745,
+        "Y": 1094.5114714052195
+      },
+      {
+        "Id": "0c421db88b89420ead7fa793f0291b5e",
+        "Name": "List.GetItemAtIndex",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 8913.1401216480917,
+        "Y": 1030.8725012307148
+      },
+      {
+        "Id": "a81b74789b524c45ad9f4f07772f86ab",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 8688.4047852028016,
+        "Y": 1098.0907847767057
+      },
+      {
+        "Id": "2f524280be164a88826e05f9c35c0587",
+        "Name": "List.GetItemAtIndex",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 8918.6497047282119,
+        "Y": 1534.9993530617896
+      },
+      {
+        "Id": "1613955bf2084f2e9ce957239609050b",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 8685.64999366274,
+        "Y": 1580.1793042872964
+      },
+      {
+        "Id": "87fecba4eeda4006b03bbb610d8528e8",
+        "Name": "Element.SetParameterByName",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 9528.0226444920118,
+        "Y": 1298.7556357756137
+      },
+      {
+        "Id": "cc4590f8efd446dc9991bda512061e3f",
+        "Name": "Element.SetParameterByName",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 2675.7159330528052,
+        "Y": -903.97876823293484
+      },
+      {
+        "Id": "caa2720c604745398a4d6747017e1a18",
+        "Name": "次数中心性のパラメーター名",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 204.36422358643608,
+        "Y": -808.04936439936091
+      },
+      {
+        "Id": "6ac8c9a983ab4d77b3b51c9fe9d87cbd",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 2172.6017583230337,
+        "Y": -1143.01791592279
+      },
+      {
+        "Id": "86ee69c7d269412aa24ba1fb5cf3f45c",
+        "Name": "Element.SetParameterByName",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 2669.5102658405003,
+        "Y": -1428.6644171007383
+      },
+      {
+        "Id": "707ae259111849928902ec4e1c05d183",
+        "Name": "If",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 3888.9641955686088,
+        "Y": -307.34439835423586
+      },
+      {
+        "Id": "08523dbd06584a7ca6ddb031b0d34abb",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 3439.5525681021636,
+        "Y": -435.69222200236823
+      },
+      {
+        "Id": "8ef3af4f371841d5a8e0f8406feca426",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 3663.4511400484535,
+        "Y": -172.14397127648215
+      }
+    ],
+    "Annotations": [
+      {
+        "Id": "fedbcc9026de40b0b43e66f7f4ebe0af",
+        "Title": "建具を入力してつなぐ部屋を出力する。\r\n重複するものやnullが含まれるものは削除する。",
+        "DescriptionText": "結論：使用可能",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "daff1351aebd428aa2f6019e9ff34a56",
+          "300c1b9f2ffc4c34bc071a08c17e4d16"
+        ],
+        "HasNestedGroups": false,
+        "Left": 5594.5348408095688,
+        "Top": 117.30648199591192,
+        "Width": 927.44572479713861,
+        "Height": 255.02775073704854,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": 232.90648199591192,
+        "InitialHeight": 212.73675035866285,
+        "TextblockHeight": 105.6,
+        "Background": "#FFC1D676"
+      },
+      {
+        "Id": "2370f554e5274bc8abf002a8bf97a948",
+        "Title": "部屋から部屋境界線で隣り合う部屋の組み合わせを抽出する",
+        "DescriptionText": "結論：使用可能",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "b3b10b5276e34f358a30e266a1645814",
+          "e31404e7cdee47f9aa52cd4d5f857d01"
+        ],
+        "HasNestedGroups": false,
+        "Left": 5552.5116441496157,
+        "Top": -585.98237869959769,
+        "Width": 989.44439657835846,
+        "Height": 209.01948794133153,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": -513.58237869959771,
+        "InitialHeight": 149.81948794133143,
+        "TextblockHeight": 62.4,
+        "Background": "#FFC1D676"
+      },
+      {
+        "Id": "4d504193e1db4f14a132cda48091837d",
+        "Title": "部屋に近接中心性の値を入力",
+        "DescriptionText": "説明<グループの説明を編集するにはここをダブル クリック>",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "e14379c3809b4bb19d09adee56f8c29a",
+          "24c3660605a3422195ce94c33367a909",
+          "7cafe7bb8f414371b0b1c8dfa1cc1319",
+          "f5dd29113d654fdb914d213efe793ce9",
+          "6a92eed44d8d4695a2a3f08fdb9edeb9"
+        ],
+        "HasNestedGroups": false,
+        "Left": 8725.6233092650982,
+        "Top": -723.36592418282078,
+        "Width": 1165.5726508292664,
+        "Height": 753.50680305658125,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": -650.9659241828208,
+        "InitialHeight": 711.10680305658138,
+        "TextblockHeight": 62.4,
+        "Background": "#FFC1D676"
+      },
+      {
+        "Id": "858d3ece71e14adca109067e33033a2f",
+        "Title": "部屋の組合せから近接中心性を求める",
+        "DescriptionText": "説明<グループの説明を編集するにはここをダブル クリック>",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "3d46a4b9782d4da292866a0b3c172329"
+        ],
+        "HasNestedGroups": false,
+        "Left": 7701.5284177127005,
+        "Top": -569.89270582092,
+        "Width": 578.82666666666671,
+        "Height": 205.79999999999995,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": -497.49270582092004,
+        "InitialHeight": 163.40000000000003,
+        "TextblockHeight": 62.4,
+        "Background": "#FFC1D676"
+      },
+      {
+        "Id": "22d9cfbb460b40ec8ee31feaa7d0433b",
+        "Title": "部屋の組合せから次数中心性を求める",
+        "DescriptionText": "説明<グループの説明を編集するにはここをダブル クリック>",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "438441ae9f7d4966ac828360f1faecfe"
+        ],
+        "HasNestedGroups": false,
+        "Left": 7729.4175899875745,
+        "Top": 1022.1114714052195,
+        "Width": 578.82666666666671,
+        "Height": 205.80000000000007,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": 1094.5114714052195,
+        "InitialHeight": 163.40000000000009,
+        "TextblockHeight": 62.4,
+        "Background": "#FFC1D676"
+      },
+      {
+        "Id": "bf5be6fb1abb4c339e8723d7275c7c16",
+        "Title": "部屋に近接中心性の値を入力",
+        "DescriptionText": "説明<グループの説明を編集するにはここをダブル クリック>",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "0c421db88b89420ead7fa793f0291b5e",
+          "a81b74789b524c45ad9f4f07772f86ab",
+          "2f524280be164a88826e05f9c35c0587",
+          "1613955bf2084f2e9ce957239609050b",
+          "87fecba4eeda4006b03bbb610d8528e8"
+        ],
+        "HasNestedGroups": false,
+        "Left": 8675.64999366274,
+        "Top": 958.47250123071478,
+        "Width": 1165.5726508292719,
+        "Height": 753.50680305658159,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": 1030.8725012307148,
+        "InitialHeight": 711.10680305658184,
+        "TextblockHeight": 62.4,
+        "Background": "#FFC1D676"
+      },
+      {
+        "Id": "b26ebf112632490396b6dd02ab0fedcb",
+        "Title": "部屋に入力されている近接中心性と次数中心性を空にする",
+        "DescriptionText": "説明<グループの説明を編集するにはここをダブル クリック>",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "cc4590f8efd446dc9991bda512061e3f",
+          "6ac8c9a983ab4d77b3b51c9fe9d87cbd",
+          "86ee69c7d269412aa24ba1fb5cf3f45c"
+        ],
+        "HasNestedGroups": false,
+        "Left": 2162.6017583230337,
+        "Top": -1544.2644171007382,
+        "Width": 865.70333333333338,
+        "Height": 837.68564886780337,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": -1428.6644171007383,
+        "InitialHeight": 773.38471252672991,
+        "TextblockHeight": 105.6,
+        "Background": "#FFC1D676"
+      },
+      {
+        "Id": "d3ed338e801a41589af9586eb0b866d6",
+        "Title": "入力された建具の部屋計算ポイントの部屋の\r\n近接中心性、もしくは次数中心性を比べて\r\n取付場所_変数に変数を入力する。",
+        "DescriptionText": "部屋から　>　部屋へ　→　2\r\n部屋から　<　部屋へ　→　1\r\n空の場合　→　0",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "26a70bbc030442ed8ba08ecf4f8f31d7"
+        ],
+        "HasNestedGroups": false,
+        "Left": 11106.970798596116,
+        "Top": 305.55415654102706,
+        "Width": 660.18000000000006,
+        "Height": 425.0,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": 531.554156541027,
+        "InitialHeight": 163.39999999999998,
+        "TextblockHeight": 216.0,
+        "Background": "#FFC1D676"
+      },
+      {
+        "Id": "bdb0924c8b67411ba4540217b3d252db",
+        "Title": "部屋に入力されている近接中心性と次数中心性を空になったら次に進む",
+        "DescriptionText": "説明<グループの説明を編集するにはここをダブル クリック>",
+        "IsExpanded": true,
+        "WidthAdjustment": 0.0,
+        "HeightAdjustment": 0.0,
+        "Nodes": [
+          "707ae259111849928902ec4e1c05d183",
+          "08523dbd06584a7ca6ddb031b0d34abb",
+          "8ef3af4f371841d5a8e0f8406feca426"
+        ],
+        "HasNestedGroups": false,
+        "Left": 3429.5525681021636,
+        "Top": -551.29222200236825,
+        "Width": 1045.6866666666667,
+        "Height": 510.94825072588617,
+        "FontSize": 36.0,
+        "GroupStyleId": "00000000-0000-0000-0000-000000000000",
+        "InitialTop": -435.69222200236823,
+        "InitialHeight": 425.34825072588609,
+        "TextblockHeight": 105.6,
+        "Background": "#FFC1D676"
+      }
+    ],
+    "X": 99.343430759260173,
+    "Y": 261.45715403694038,
+    "Zoom": 0.15020101313803927
+  }
+}
